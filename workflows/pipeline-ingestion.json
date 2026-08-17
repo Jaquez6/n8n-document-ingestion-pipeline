@@ -1,0 +1,303 @@
+{
+  "name": "My workflow 2",
+  "nodes": [
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a6f8d3ec-b23b-4610-a042-a4c810a25567",
+              "leftValue": "={{ $json.estado_validacion }}",
+              "rightValue": "error",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            },
+            {
+              "id": "c3c744fb-0c82-444c-9820-d5d2ce5ccaeb",
+              "leftValue": "={{ $json.estado_validacion }}",
+              "rightValue": "duplicado",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        144,
+        -496
+      ],
+      "id": "aeec7a0c-47a3-44b0-8c4c-e5b7e7e5d3cc",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "jsCode": "const respuesta = $input.first().json;\nconst textoJSON = respuesta.content.parts[0].text;\nlet datosExtraidos = JSON.parse(textoJSON);\n\n// Si Gemini devolvió un array en vez de un objeto, tomamos el primer elemento\nif (Array.isArray(datosExtraidos)) {\n  datosExtraidos = datosExtraidos[0];\n}\n\n// Validar fecha_emision\nconst fechaValida = /^\\d{4}-\\d{2}-\\d{2}$/.test(datosExtraidos.fecha_emision)\n  && datosExtraidos.fecha_emision !== \"0000-00-00\";\nif (!fechaValida) {\n  datosExtraidos.fecha_emision = null;\n}\n\ndatosExtraidos.items = datosExtraidos.items || [];\n\nreturn [{ json: datosExtraidos }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -432,
+        -496
+      ],
+      "id": "68eb9036-3239-449b-918c-b600a2d43ed3",
+      "name": "Parse Document"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  (SELECT COUNT(*) FROM documentos \n   WHERE hash_duplicado = md5(COALESCE('{{ $json.numero_documento }}', '') || '-' || COALESCE('{{ $json.proveedor_ruc }}', ''))\n   AND '{{ $json.numero_documento }}' != '' AND '{{ $json.proveedor_ruc }}' != '') as es_duplicado,\n  (SELECT AVG(total) FROM documentos WHERE proveedor_ruc = '{{ $json.proveedor_ruc }}') as promedio_historico,\n  (SELECT COUNT(*) FROM documentos WHERE proveedor_ruc = '{{ $json.proveedor_ruc }}') as cantidad_historica",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        -496
+      ],
+      "id": "47b3091a-783e-4614-9996-00f74fcc2f4e",
+      "name": "Check Duplicate And History",
+      "credentials": {
+        "postgres": {
+          "id": "cZAaKL8gNiwbUIYi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const doc = $('Parse Document').item.json;\nconst consulta = $input.item.json;\n\n// --- Paso 1: campos críticos faltantes → error ---\nconst camposCriticos = ['numero_documento', 'proveedor_ruc', 'total', 'fecha_emision'];\nconst faltantes = camposCriticos.filter(campo =>\n  doc[campo] === null || doc[campo] === undefined || doc[campo] === ''\n);\n\nif (faltantes.length > 0) {\n  return {\n    ...doc,\n    hash_duplicado: null,\n    estado_validacion: 'error',\n    motivo_revision: `Campos críticos faltantes: ${faltantes.join(', ')}`,\n    mensaje_discord: `❌ **Error de extracción**\\nDocumento: ${doc.numero_documento || 'sin número'}\\nMotivo: Campos críticos faltantes: ${faltantes.join(', ')}`\n  };\n}\n\nconst crypto = require('crypto');\nconst hash = crypto.createHash('md5')\n  .update(`${doc.numero_documento}-${doc.proveedor_ruc}`)\n  .digest('hex');\n\n// --- Paso 2: duplicado → no se inserta, se corta aquí ---\nif (consulta.es_duplicado > 0) {\n  return {\n    ...doc,\n    hash_duplicado: hash,\n    estado_validacion: 'duplicado',\n    motivo_revision: 'Documento duplicado (mismo número + RUC ya existe)',\n    mensaje_discord: `🔁 **Documento duplicado**\\nDocumento: ${doc.numero_documento} (${doc.proveedor_ruc})\\nYa existe en la base de datos, no se insertó de nuevo.`\n  };\n}\n\n// --- Paso 3: anomalía de monto → sí se inserta, marcado para revisión ---\nlet estado_validacion = 'ok';\nlet motivos = [];\n\nif (consulta.cantidad_historica >= 3) {\n  const promedio = parseFloat(consulta.promedio_historico);\n  const desviacion = Math.abs(doc.total - promedio) / promedio;\n  if (desviacion > 0.5) {\n    estado_validacion = 'revision';\n    motivos.push(`Monto atípico: ${doc.total} vs promedio histórico ${promedio.toFixed(2)}`);\n  }\n}\n\nconst mensaje_discord = estado_validacion === 'revision'\n  ? `⚠️ **Requiere revisión**\\nDocumento: ${doc.numero_documento} (${doc.proveedor_ruc})\\nTotal: ${doc.total} ${doc.moneda}\\nMotivo: ${motivos.join('; ')}`\n  : `✅ Documento procesado: ${doc.numero_documento} — ${doc.total} ${doc.moneda}`;\n\nreturn {\n  ...doc,\n  hash_duplicado: hash,\n  estado_validacion,\n  motivo_revision: motivos.join('; ') || null,\n  mensaje_discord\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        -496
+      ],
+      "id": "e40087a6-5e3d-492b-8ade-3e8c4b1f04db",
+      "name": "Validate Document"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO documentos (\n  tipo_documento, numero_documento, fecha_emision,\n  proveedor_nombre, proveedor_ruc,\n  cliente_nombre, cliente_ruc,\n  moneda, items, subtotal, total,\n  fuente_documento, canal_recepcion,\n  estado_validacion, motivo_revision, hash_duplicado\n) VALUES (\n  $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16\n)",
+        "options": {
+          "queryReplacement": "={{ $json.tipo_documento }}\n{{ $json.numero_documento }}\n{{ $json.fecha_emision }}\n{{ $json.proveedor_nombre }}\n{{ $json.proveedor_ruc }}\n{{ $json.cliente_nombre }}\n{{ $json.cliente_ruc }}\n{{ $json.moneda }}\n{{ JSON.stringify($json.items) }}\n{{ $json.subtotal }}\n{{ $json.total }}\n{{ $json.fuente_documento }}\n{{ $json.canal_recepcion }}\n{{ $json.estado_validacion }}\n{{ $json.motivo_revision }}\n{{ $json.hash_duplicado }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        320,
+        -352
+      ],
+      "id": "b002904e-d9bb-4910-bc1e-cabcf2deb080",
+      "name": "Insert Document",
+      "credentials": {
+        "postgres": {
+          "id": "cZAaKL8gNiwbUIYi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "guildId": {
+          "__rl": true,
+          "value": "1184433862512754778",
+          "mode": "list",
+          "cachedResultName": "Jaquez",
+          "cachedResultUrl": "https://discord.com/channels/1184433862512754778"
+        },
+        "channelId": {
+          "__rl": true,
+          "value": "1535741357245599767",
+          "mode": "list",
+          "cachedResultName": "n8n",
+          "cachedResultUrl": "https://discord.com/channels/1184433862512754778/1535741357245599767"
+        },
+        "content": "={{ $('Validate Document').item.json.mensaje_discord }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        480,
+        -512
+      ],
+      "id": "0df98737-bfc4-4920-85e2-fb3ff3ce05aa",
+      "name": "Notify Discord",
+      "webhookId": "3469133f-9318-4358-87cf-a580623f9f60",
+      "credentials": {
+        "discordBotApi": {
+          "id": "pmWg40cvAsrixxn0",
+          "name": "Discord Bot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ingesta-documento",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -912,
+        -496
+      ],
+      "id": "ec9641bd-94e3-46ae-8eb3-2140d647d726",
+      "name": "Document Webhook",
+      "webhookId": "a18dc3cd-2d1d-4823-87bf-5e1fa025d7be"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "models/gemini-3-flash-preview"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Extrae los datos de la siguiente factura y devuélvelos ÚNICAMENTE en formato JSON válido, sin texto adicional, siguiendo este esquema exacto.\n\nIMPORTANTE sobre fechas: el campo fecha_emision debe contener la fecha REAL encontrada en el documento, convertida a formato YYYY-MM-DD. Por ejemplo, si el documento dice \"12/03/2026\", debes escribir \"2026-03-12\". NUNCA uses \"0000-00-00\" ni dejes el campo vacío — si realmente no encuentras una fecha en el texto, usa null.\n\n{\n  \"tipo_documento\": \"factura\",\n  \"numero_documento\": \"\",\n  \"fecha_emision\": \"YYYY-MM-DD\",\n  \"proveedor_nombre\": \"\",\n  \"proveedor_ruc\": \"\",\n  \"cliente_nombre\": \"\",\n  \"cliente_ruc\": \"\",\n  \"moneda\": \"\",\n  \"items\": [{\"descripcion\": \"\", \"cantidad\": 0, \"precio_unitario\": 0, \"subtotal\": 0}],\n  \"subtotal\": 0,\n  \"total\": 0,\n  \"fuente_documento\": \"pdf\",\n  \"canal_recepcion\": \"adjunto\",\n  \"estado_validacion\": \"ok\"\n}\n\n{{ $json.body.texto_documento }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        -736,
+        -496
+      ],
+      "id": "b32858e8-5f0f-4174-81d7-adbad2701d75",
+      "name": "Extract Document Data",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "ZidbdSl3cjyoX7eR",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Notify Discord",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Insert Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Document": {
+      "main": [
+        [
+          {
+            "node": "Check Duplicate And History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Duplicate And History": {
+      "main": [
+        [
+          {
+            "node": "Validate Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Document": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Document": {
+      "main": [
+        [
+          {
+            "node": "Notify Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Document Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Document Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Document Data": {
+      "main": [
+        [
+          {
+            "node": "Parse Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "50d51f61-7d6a-4bb3-8cef-092f85735d08",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8dc5e7ebfe32040cfd42df61a50a8b31eb1242d547adda122f975ce325506301"
+  },
+  "id": "W50bt7RMu8uP8NbE",
+  "tags": []
+}

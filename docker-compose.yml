@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - db_storage:/var/lib/postgresql/data
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: always
+    ports:
+      - "5678:5678"
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_DATABASE=${DB_NAME}
+      - DB_POSTGRESDB_HOST=db
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_USER=${DB_USER}
+      - DB_POSTGRESDB_PASSWORD=${DB_PASSWORD}
+      - NODE_FUNCTION_ALLOW_BUILTIN=crypto
+    volumes:
+      - n8n_storage:/home/node/.n8n
+    depends_on:
+      - db
+
+volumes:
+  db_storage:
+  n8n_storage:
